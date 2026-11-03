@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { promises as fs } from "fs";
+import { promises as fs, createWriteStream } from "fs";
+import { finished } from "stream/promises";
+import archiver from "archiver";
 import os from "os";
 import path from "path";
 import { getMetaDataFromFile } from "../../src/routes/slicing/slicing.service";
@@ -57,6 +59,27 @@ async function gcodeFile(content: string): Promise<string> {
   return file;
 }
 
+async function threeMfFile(plates: string[]): Promise<string> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gcode-meta-"));
+  created.push(dir);
+  const file = path.join(dir, "result.3mf");
+  const output = createWriteStream(file);
+  const archive = archiver("zip");
+  archive.on("error", (error) => output.destroy(error));
+  archive.pipe(output);
+  plates.forEach((content, index) => {
+    archive.append(content, { name: `Metadata/plate_${index + 1}.gcode` });
+  });
+  archive.append("not G-code", { name: "Metadata/notes.txt" });
+  await Promise.all([finished(output), archive.finalize()]);
+  return file;
+}
+
+const MULTI_TOOL_HEADER = `; filament used [g] = 0.87, 1.14, 0.61, 0.57
+; filament used [mm] = 10, 20.5, 0, 1.25
+; estimated printing time (normal mode) = 1m 40s
+`;
+
 afterEach(async () => {
   await Promise.all(
     created.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
@@ -64,6 +87,71 @@ afterEach(async () => {
 });
 
 describe("G-code metadata extraction", () => {
+  it("sums every tool instead of reporting only the first tool", async () => {
+    const data = await getMetaDataFromFile(await gcodeFile(MULTI_TOOL_HEADER));
+    expect(data.filamentUsedG).toBeCloseTo(3.19);
+    expect(data.filamentUsedMm).toBeCloseTo(31.75);
+    expect(data.printTime).toBe(100);
+  });
+
+  it("accepts zero slots, whitespace and finite decimal/exponent values", async () => {
+    const data = await getMetaDataFromFile(await gcodeFile(
+      "; filament used [g] = 0,\t.5, 1.25e1, 0.00\r\n" +
+      "; filament used [mm] = 1.0, 2E2, 0\r\n",
+    ));
+    expect(data.filamentUsedG).toBe(13);
+    expect(data.filamentUsedMm).toBe(201);
+  });
+
+  it.each([
+    "", "1,", ",1", "1,,2", "1, ,2", "1, junk", "1, 2g",
+    "1; 2", "1 2", "1, -2", "-1", "1, NaN", "1, Infinity",
+    "1, 1e309", "1e308, 1e308", "0x10", "[1, 2]",
+  ])("rejects the entire malformed or non-finite vector %j", async (value) => {
+    const data = await getMetaDataFromFile(await gcodeFile(
+      `; filament used [g] = ${value}\n; filament used [mm] = ${value}\n`,
+    ));
+    expect(data.filamentUsedG).toBe(0);
+    expect(data.filamentUsedMm).toBe(0);
+  });
+
+  it("keeps dialect precedence without adding a duplicate total", async () => {
+    const data = await getMetaDataFromFile(await gcodeFile(MULTI_TOOL_HEADER + BAMBU_HEADER));
+    expect(data.filamentUsedG).toBeCloseTo(3.19);
+    expect(data.filamentUsedMm).toBeCloseTo(31.75);
+  });
+
+  it("does not read filament values from another line or inside a message", async () => {
+    const data = await getMetaDataFromFile(await gcodeFile(
+      "; filament used [g] =\n123\nM117 ; filament used [mm] = 20\n",
+    ));
+    expect(data.filamentUsedG).toBe(0);
+    expect(data.filamentUsedMm).toBe(0);
+  });
+
+  it("sums all tools and plates in a real 3MF archive", async () => {
+    const data = await getMetaDataFromFile(await threeMfFile([MULTI_TOOL_HEADER, BAMBU_HEADER]));
+    expect(data.filamentUsedG).toBeCloseTo(3.91);
+    expect(data.filamentUsedMm).toBeCloseTo(272.44);
+    expect(data.printTime).toBe(100 + 16 * 60 + 33);
+  });
+
+  it("does not include a partially valid vector from a 3MF plate", async () => {
+    const data = await getMetaDataFromFile(await threeMfFile([
+      "; filament used [g] = 1, -2\n; filament used [mm] = 1, Infinity\n",
+      BAMBU_HEADER,
+    ]));
+    expect(data.filamentUsedG).toBeCloseTo(0.72);
+    expect(data.filamentUsedMm).toBeCloseTo(240.69);
+  });
+
+  it("does not return infinite filament totals across 3MF plates", async () => {
+    const plate = "; filament used [g] = 1e308\n; filament used [mm] = 1e308\n";
+    const data = await getMetaDataFromFile(await threeMfFile([plate, plate]));
+    expect(data.filamentUsedG).toBe(0);
+    expect(data.filamentUsedMm).toBe(0);
+  });
+
   it("reads OrcaSlicer's header", async () => {
     const data = await getMetaDataFromFile(
       await gcodeFile(ORCA_HEADER + CONFIG_BLOCK_NOISE),

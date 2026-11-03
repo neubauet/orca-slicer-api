@@ -399,6 +399,9 @@ export async function getMetaDataFromFile(
     }
   }
 
+  // Individually finite plate totals can still overflow when combined.
+  data.filamentUsedG = finiteUsageOrZero(data.filamentUsedG);
+  data.filamentUsedMm = finiteUsageOrZero(data.filamentUsedMm);
   return data;
 }
 
@@ -563,19 +566,36 @@ const PRINT_TIME_PATTERNS = [
 ];
 
 const FILAMENT_MM_PATTERNS = [
-  /; filament used \[mm\] =\s*(\d+(?:\.\d+)?)/,
-  /; total filament length \[mm\]\s*:\s*(\d+(?:\.\d+)?)/,
+  /^[\t ]*; filament used \[mm\] =[\t ]*([^\r\n]*)/m,
+  /^[\t ]*; total filament length \[mm\][\t ]*:[\t ]*([^\r\n]*)/m,
 ];
 
 const FILAMENT_G_PATTERNS = [
-  /; filament used \[g\] =\s*(\d+(?:\.\d+)?)/,
-  /; total filament weight \[g\]\s*:\s*(\d+(?:\.\d+)?)/,
+  /^[\t ]*; filament used \[g\] =[\t ]*([^\r\n]*)/m,
+  /^[\t ]*; total filament weight \[g\][\t ]*:[\t ]*([^\r\n]*)/m,
 ];
 
-function firstNumber(content: string, patterns: RegExp[]): number {
+function finiteUsageOrZero(value: number): number {
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function filamentTotal(content: string, patterns: RegExp[]): number {
   for (const pattern of patterns) {
     const match = content.match(pattern);
-    if (match) return parseFloat(match[1]);
+    if (!match) continue;
+    // Orca emits one comma-separated value per tool. Validate every complete
+    // token before returning a total: a partial/malformed vector is unknown,
+    // not a plausible but undercounted first-tool value. Scalar headers from
+    // both slicers are simply vectors of length one.
+    let total = 0;
+    for (const token of match[1].split(",")) {
+      const value = token.trim();
+      if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) return 0;
+      const amount = Number(value);
+      if (!Number.isFinite(amount)) return 0;
+      total += amount;
+    }
+    return finiteUsageOrZero(total);
   }
   return 0;
 }
@@ -597,8 +617,8 @@ function parseMetaDataFromString(content: string): SliceMetaData {
   try {
     return {
       printTime: parseDuration(content, PRINT_TIME_PATTERNS),
-      filamentUsedG: firstNumber(content, FILAMENT_G_PATTERNS),
-      filamentUsedMm: firstNumber(content, FILAMENT_MM_PATTERNS),
+      filamentUsedG: filamentTotal(content, FILAMENT_G_PATTERNS),
+      filamentUsedMm: filamentTotal(content, FILAMENT_MM_PATTERNS),
     };
   } catch (err) {
     console.error("Failed to parse metadata from string:", err);
